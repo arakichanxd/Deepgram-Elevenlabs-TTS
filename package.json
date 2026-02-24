@@ -1,0 +1,18 @@
+{
+    "name": "openai-tts-proxy",
+    "version": "1.0.0",
+    "description": "OpenAI-compatible TTS API powered by ElevenLabs via Deepgram Agent API",
+    "main": "server.js",
+    "scripts": {
+        "start": "node server.js",
+        "dev": "node --watch server.js"
+    },
+    "dependencies": {
+        "express": "^4.18.2",
+        "openai": "^6.24.0",
+        "ws": "^8.16.0"
+    },
+    "engines": {
+        "node": ">=18.0.0"
+    }
+}
