@@ -259,6 +259,9 @@ app.get("/health", (_req, res) => {
     });
 });
 
+// ─── Root (Render health check) ──────────────────────────────────────────────
+app.get("/", (_req, res) => res.json({ status: "ok", service: "openai-tts-proxy", docs: "POST /v1/audio/speech, GET /v1/models, GET /health" }));
+
 // ─── Catch-all & error handler ───────────────────────────────────────────────
 app.use((req, res) => openaiError(res, 404, `Unknown request URL: ${req.method} ${req.path}`));
 app.use((err, _req, res, _next) => { console.error("Unhandled:", err); openaiError(res, 500, "Internal server error", "server_error"); });
@@ -274,7 +277,7 @@ process.on("SIGTERM", () => shutdown("SIGTERM"));
 process.on("SIGINT", () => shutdown("SIGINT"));
 
 // ─── Start ───────────────────────────────────────────────────────────────────
-server = app.listen(PORT, () => {
+server = app.listen(PORT, "0.0.0.0", () => {
     console.log(`\n🔊 OpenAI-compatible TTS API v1.0.0`);
     console.log(`   http://localhost:${PORT}`);
     console.log(`   POST /v1/audio/speech`);
