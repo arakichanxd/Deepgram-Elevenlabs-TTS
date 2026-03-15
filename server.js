@@ -1,3 +1,4 @@
+require("dotenv").config();
 const express = require("express");
 const WebSocket = require("ws");
 const crypto = require("crypto");
@@ -88,10 +89,11 @@ function cleanupCache() {
 }
 
 // ─── Synthesize via Deepgram Agent WebSocket ─────────────────────────────────
-function synthesize(text, requestId) {
+function synthesize(text, requestId, voiceName = "jessica", res = null, response_format = "wav") {
     return new Promise((resolve, reject) => {
         const audioChunks = [];
         let settled = false;
+        let headersSent = false;
         const t0 = Date.now();
 
         const ws = new WebSocket("wss://agent.deepgram.com/v1/agent/converse", [
@@ -102,6 +104,57 @@ function synthesize(text, requestId) {
             if (!settled) { settled = true; ws.close(); reject(new Error("TTS timed out")); }
         }, WS_TIMEOUT_MS);
 
+        // Voice registry — supports multiple TTS providers
+        const voiceRegistry = {
+            // ── ElevenLabs ──────────────────────────────────────────────────
+            "jessica": {
+                provider: {
+                    type: "eleven_labs",
+                    model_id: "eleven_multilingual_v2",
+                    voice_id: "cgSgspJ2msm6clMCkdW9",
+                }
+            },
+            "daniel": {
+                provider: {
+                    type: "eleven_labs",
+                    model_id: "eleven_multilingual_v2",
+                    voice_id: "onwK4e9ZLuTAKqWW03F9",
+                }
+            },
+            "piper": {
+                provider: {
+                    type: "eleven_labs",
+                    model_id: "eleven_multilingual_v2",
+                    voice_id: "DtsPFCrhbCbbJkwZsb3d",
+                }
+            },
+            "mark": {
+                provider: {
+                    type: "eleven_labs",
+                    model_id: "eleven_multilingual_v2",
+                    voice_id: "UgBBYS2sOqTuMpoF3BR0",
+                }
+            },
+            // ── Cartesia ────────────────────────────────────────────────────
+            "kentucky_man": {
+                provider: {
+                    type: "cartesia",
+                    model_id: "sonic-2",
+                    voice: { mode: "id", id: "726d5ae5-055f-4c3d-8355-d9677de68937" },
+                }
+            },
+            "helpful_woman": {
+                provider: {
+                    type: "cartesia",
+                    model_id: "sonic-2",
+                    voice: { mode: "id", id: "156fb8d2-335b-4950-9cb3-a2d33befec77" },
+                }
+            },
+        };
+
+        const voiceKey = voiceName.toLowerCase().replace(/[\s-]+/g, "_");
+        const voiceConfig = voiceRegistry[voiceKey] || voiceRegistry["jessica"];
+
         ws.on("open", () => {
             ws.send(JSON.stringify({
                 type: "Settings",
@@ -111,7 +164,7 @@ function synthesize(text, requestId) {
                 },
                 agent: {
                     language: "en",
-                    speak: { provider: { type: "eleven_labs", model_id: "eleven_multilingual_v2", voice_id: "cgSgspJ2msm6clMCkdW9" } },
+                    speak: voiceConfig,
                     listen: { provider: { type: "deepgram", version: "v1", model: "nova-3" } },
                     think: { provider: { type: "open_ai", model: "gpt-4o-mini" }, prompt: "TTS engine. Do not respond." },
                     greeting: text,
@@ -119,15 +172,37 @@ function synthesize(text, requestId) {
             }));
         });
 
+
         ws.on("message", (data, isBinary) => {
             if (settled) return;
-            if (isBinary) { audioChunks.push(Buffer.from(data)); return; }
+            if (isBinary) { 
+                const chunk = Buffer.from(data);
+                audioChunks.push(chunk); 
+                
+                if (res) {
+                    if (!headersSent) {
+                        res.setHeader("Content-Type", response_format === "pcm" ? "audio/pcm" : "audio/wav");
+                        res.setHeader("Transfer-Encoding", "chunked");
+                        res.setHeader("x-request-id", requestId);
+                        // Send a dummy WAV header of maximum length if needed, or omit it. 
+                        // Because we stream real-time, we cannot know the final dataSize for WAV. 
+                        // However, chunked transfer audio playback usually tolerates "0xFFFFFFFF" data block size.
+                        if (response_format !== "pcm") {
+                            res.write(wavHeader(0xFFFFFFFF));
+                        }
+                        headersSent = true;
+                    }
+                    res.write(chunk);
+                }
+                return; 
+            }
             try {
                 const msg = JSON.parse(data.toString());
                 if (msg.type === "AgentAudioDone") {
                     settled = true; clearTimeout(timer);
                     const pcm = Buffer.concat(audioChunks);
                     console.log(`[${requestId}] ✅ ${pcm.length}B ${audioChunks.length} chunks ${Date.now() - t0}ms`);
+                    if (res) res.end();
                     ws.close(); resolve(pcm);
                 } else if (msg.type === "Error") {
                     settled = true; clearTimeout(timer); ws.close();
@@ -193,21 +268,18 @@ app.post("/v1/audio/speech", auth, async (req, res) => {
 
         console.log(`[${rid}] POST /v1/audio/speech model=${model} voice=${voice} fmt=${response_format} len=${input.length}`);
 
-        // Synthesize
-        const pcmData = await synthesize(input, rid);
-        if (pcmData.length === 0) return openaiError(res, 500, "No audio data received", "server_error");
+        // Synthesize via streaming to response directly
+        const pcmData = await synthesize(input, rid, voice, res, response_format);
+        if (pcmData.length === 0 && !res.headersSent) return openaiError(res, 500, "No audio data received", "server_error");
 
-        // Build response audio
+        // The actual binary data was already streamed to 'res'.
+        // However, we still need to build the audio file for the cache system.
         let audioBuffer;
-        let contentType;
-
         if (response_format === "pcm") {
             audioBuffer = pcmData;
-            contentType = "audio/pcm";
         } else {
-            // For wav, mp3, opus, aac, flac — return WAV (our backend produces linear16 PCM)
+            // Reconstruct the proper valid WAV block locally with correct final content length to save to disk.
             audioBuffer = Buffer.concat([wavHeader(pcmData.length), pcmData]);
-            contentType = "audio/wav";
         }
 
         // Save to cache & cleanup
@@ -215,12 +287,7 @@ app.post("/v1/audio/speech", auth, async (req, res) => {
         const filename = `${Date.now()}_${crypto.randomBytes(4).toString("hex")}.${ext}`;
         fs.writeFileSync(path.join(CACHE_DIR, filename), audioBuffer);
         setImmediate(cleanupCache);
-
-        // Send response (matches OpenAI: binary audio with Content-Length)
-        res.setHeader("Content-Type", contentType);
-        res.setHeader("Content-Length", audioBuffer.length);
-        res.setHeader("x-request-id", rid);
-        res.send(audioBuffer);
+        
     } catch (err) {
         console.error(`[${rid}] ❌ ${err.message}`);
         if (!res.headersSent) openaiError(res, 500, err.message, "server_error");
@@ -252,8 +319,11 @@ app.get("/health", (_req, res) => {
         version: "1.0.0",
         service: "openai-tts-proxy",
         deepgram: !!DEEPGRAM_API_KEY,
-        backend: "eleven_labs via deepgram",
-        voice: "jessica",
+        providers: {
+            eleven_labs: ["jessica", "daniel", "piper", "mark"],
+            cartesia: ["kentucky_man", "helpful_woman"],
+        },
+        voices: ["jessica", "daniel", "kentucky_man", "helpful_woman", "piper", "mark"],
         models: Object.keys(MODELS),
         cache: { files: cacheFiles, max: MAX_CACHE_FILES },
     });
@@ -284,7 +354,7 @@ server = app.listen(PORT, "0.0.0.0", () => {
     console.log(`   GET  /v1/models`);
     console.log(`   GET  /v1/audio/files`);
     console.log(`   GET  /health`);
-    console.log(`   Backend: ElevenLabs Jessica via Deepgram`);
+    console.log(`   Backend: ElevenLabs (Jessica & Daniel) via Deepgram`);
     console.log(`   Cache: max ${MAX_CACHE_FILES} files`);
     console.log(`   Deepgram: ${DEEPGRAM_API_KEY ? "✅" : "❌ missing"}\n`);
 });
